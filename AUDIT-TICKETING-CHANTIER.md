@@ -1951,6 +1951,347 @@ ORDER BY nb_tickets DESC;
 
 ---
 
+## 📚 10. Guide d'Implémentation Complète
+
+### 🛠️ **Étapes de Mise en Œuvre**
+
+#### **1. Préparation de l'Environnement**
+
+```bash
+# 1. Backup complet de la base Dolibarr
+mysqldump -u root -p dolibarr > dolibarr_backup_$(date +%Y%m%d).sql
+
+# 2. Créer branche de développement
+cd /var/www/dolibarr
+git checkout -b feature/btp-ticketing
+
+# 3. Activer les modules requis dans Dolibarr
+# - Module Projet obligatoire
+# - Module Facture recommandé
+# - Module API REST activé
+```
+
+#### **2. Installation du Module BTP**
+
+```bash
+# 1. Créer structure module
+mkdir -p /var/www/dolibarr/htdocs/btp
+mkdir -p /var/www/dolibarr/htdocs/btp/{admin,class,css,img,js,langs,sql,core}
+
+# 2. Scripts de création tables
+cp sql_scripts/*.sql /var/www/dolibarr/htdocs/btp/sql/
+
+# 3. Configuration module
+cat > /var/www/dolibarr/htdocs/btp/core/modules/modBTP.class.php << 'EOF'
+<?php
+class modBTP extends DolibarrModules
+{
+    public function __construct($db)
+    {
+        $this->db = $db;
+        $this->numero = 50100;
+        $this->rights_admin = 1;
+        $this->family = 'projects';
+        $this->module_position = 500;
+
+        $this->name = 'BTP';
+        $this->description = 'Module de ticketing et suivi chantier BTP';
+        $this->version = '1.0.0';
+
+        // Dépendances
+        $this->depends = ['projet', 'societe'];
+        $this->requiredby = [];
+
+        // Configuration des droits
+        $this->rights[$r][0] = 50101;
+        $this->rights[$r][1] = 'Lire les tickets BTP';
+        $this->rights[$r][3] = 1;
+        $this->rights[$r][4] = 'btp';
+        $this->rights[$r][5] = 'ticket';
+        $r++;
+
+        $this->rights[$r][0] = 50102;
+        $this->rights[$r][1] = 'Créer/modifier tickets BTP';
+        $this->rights[$r][3] = 0;
+        $this->rights[$r][4] = 'btp';
+        $this->rights[$r][5] = 'ticket';
+        $r++;
+    }
+}
+?>
+EOF
+```
+
+#### **3. Configuration Base de Données**
+
+```sql
+-- Installation complète des tables
+-- 1. Tables principales
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_intervention.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_media.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_historique.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_sla.sql;
+
+-- 2. Tables complémentaires
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_zone.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_materiel.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_ticket_temps.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_controle_qualite.sql;
+SOURCE /var/www/dolibarr/htdocs/btp/sql/llx_btp_alerte.sql;
+
+-- 3. Données de configuration initiale
+INSERT INTO llx_btp_ticket_sla (type_ticket, priority, sla_response_hours, sla_resolution_hours) VALUES
+('urgence', 5, 2, 4),
+('depannage', 4, 4, 8),
+('maintenance', 3, 8, 24),
+('installation', 2, 24, 72),
+('controle', 1, 48, 120);
+
+-- 4. Configuration droits utilisateurs
+INSERT INTO llx_user_rights (fk_user, fk_id, entity)
+SELECT rowid, 50101, 1 FROM llx_user WHERE employee = 1;
+```
+
+#### **4. Déploiement API Mobile**
+
+```javascript
+// Configuration React Native
+// 1. Installation dépendances
+npm install @react-navigation/native @react-navigation/stack
+npm install react-native-image-picker react-native-geolocation-service
+npm install @react-native-community/async-storage
+npm install react-native-signature-capture
+npm install @react-native-firebase/app @react-native-firebase/messaging
+
+// 2. Configuration API
+const API_CONFIG = {
+    BASE_URL: 'https://dolibarr.monentreprise.com/api',
+    DOLIKEY: 'votre-cle-api-dolibarr',
+    TIMEOUT: 30000,
+    RETRY_ATTEMPTS: 3
+};
+
+// 3. Service API centralisé
+export class BTPApiService {
+    static async getTickets(filters = {}) {
+        const params = new URLSearchParams(filters);
+        const response = await fetch(`${API_CONFIG.BASE_URL}/tickets?${params}`, {
+            headers: {
+                'DOLAPIKEY': API_CONFIG.DOLIKEY,
+                'Content-Type': 'application/json'
+            }
+        });
+        return await response.json();
+    }
+
+    static async createTicket(ticketData) {
+        const response = await fetch(`${API_CONFIG.BASE_URL}/tickets`, {
+            method: 'POST',
+            headers: {
+                'DOLAPIKEY': API_CONFIG.DOLIKEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(ticketData)
+        });
+        return await response.json();
+    }
+
+    static async uploadMedia(ticketId, fileUri, type) {
+        const formData = new FormData();
+        formData.append('file', {
+            uri: fileUri,
+            type: 'image/jpeg',
+            name: `${type}_${Date.now()}.jpg`
+        });
+        formData.append('fk_ticket', ticketId);
+        formData.append('media_type', type);
+
+        const response = await fetch(`${API_CONFIG.BASE_URL}/tickets/${ticketId}/media`, {
+            method: 'POST',
+            headers: {
+                'DOLAPIKEY': API_CONFIG.DOLIKEY,
+                'Content-Type': 'multipart/form-data'
+            },
+            body: formData
+        });
+        return await response.json();
+    }
+}
+```
+
+### 🔧 **Configuration Système**
+
+#### **Cron Jobs Automatisations**
+
+```bash
+# /etc/crontab - Ajout des tâches automatisées
+
+# Vérification SLA toutes les 15 minutes
+*/15 * * * * www-data /usr/bin/php /var/www/dolibarr/scripts/cron/cron_btp_sla.php
+
+# Notifications push toutes les 5 minutes
+*/5 * * * * www-data /usr/bin/php /var/www/dolibarr/scripts/cron/cron_btp_notifications.php
+
+# Synchronisation stocks quotidienne
+0 6 * * * www-data /usr/bin/php /var/www/dolibarr/scripts/cron/cron_btp_stocks.php
+
+# Rapports hebdomadaires le lundi matin
+0 8 * * 1 www-data /usr/bin/php /var/www/dolibarr/scripts/cron/cron_btp_reports.php
+```
+
+#### **Configuration Serveur Push**
+
+```javascript
+// Node.js WebSocket Server pour notifications temps réel
+// /opt/btp-notifications/server.js
+
+const WebSocket = require('ws');
+const mysql = require('mysql2/promise');
+
+const wss = new WebSocket.Server({ port: 8080 });
+const dbConfig = {
+    host: 'localhost',
+    user: 'dolibarr',
+    password: 'password',
+    database: 'dolibarr'
+};
+
+wss.on('connection', (ws, request) => {
+    console.log('Nouvelle connexion WebSocket');
+
+    ws.on('message', async (message) => {
+        const data = JSON.parse(message);
+
+        if (data.type === 'subscribe_user') {
+            ws.userId = data.userId;
+            ws.userRole = data.userRole;
+        }
+    });
+});
+
+// Fonction de broadcast d'événements
+async function broadcastEvent(eventType, eventData) {
+    const notification = {
+        type: eventType,
+        timestamp: new Date().toISOString(),
+        data: eventData
+    };
+
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            // Filtrer selon le rôle utilisateur
+            if (shouldReceiveNotification(client, eventType, eventData)) {
+                client.send(JSON.stringify(notification));
+            }
+        }
+    });
+}
+
+// Surveillance base de données pour changements
+setInterval(async () => {
+    const connection = await mysql.createConnection(dbConfig);
+
+    // Vérifier nouveaux tickets urgents
+    const [rows] = await connection.execute(`
+        SELECT * FROM llx_btp_ticket
+        WHERE priority = 5 AND status = 'nouveau'
+        AND TIMESTAMPDIFF(MINUTE, date_creation, NOW()) = 0
+    `);
+
+    rows.forEach(ticket => {
+        broadcastEvent('ticket_urgent', ticket);
+    });
+
+    await connection.end();
+}, 60000); // Vérification chaque minute
+```
+
+### 📋 **Checklist de Déploiement**
+
+#### **Avant Mise en Production**
+
+- [ ] **Base de données**
+  - [ ] Backup complet effectué
+  - [ ] Tables créées et indexées
+  - [ ] Données de test validées
+  - [ ] Performance queries vérifiée
+
+- [ ] **Sécurité**
+  - [ ] Clés API configurées
+  - [ ] Droits utilisateurs définis
+  - [ ] HTTPS activé (mobile + web)
+  - [ ] Logs sécurisés activés
+
+- [ ] **Application Mobile**
+  - [ ] Tests sur iOS et Android
+  - [ ] Notifications push fonctionnelles
+  - [ ] Mode hors ligne testé
+  - [ ] Géolocalisation précise
+
+- [ ] **Intégrations**
+  - [ ] API Dolibarr testée
+  - [ ] Synchronisation stocks OK
+  - [ ] Génération factures validée
+  - [ ] Notifications email/SMS
+
+#### **Après Mise en Production**
+
+- [ ] **Monitoring**
+  - [ ] Logs applicatifs surveillés
+  - [ ] Performance base de données
+  - [ ] Taux d'erreur API < 1%
+  - [ ] Temps réponse < 2s
+
+- [ ] **Formation**
+  - [ ] Équipe technique formée
+  - [ ] Documentation utilisateur
+  - [ ] Procédures d'urgence définies
+  - [ ] Support utilisateur organisé
+
+### 🚨 **Résolution de Problèmes Courants**
+
+#### **Performance Base de Données**
+
+```sql
+-- Si requêtes lentes sur tickets
+EXPLAIN SELECT * FROM llx_btp_ticket
+WHERE status = 'assigne' AND priority >= 4;
+
+-- Optimisation index manquants
+CREATE INDEX idx_btp_status_priority ON llx_btp_ticket (status, priority);
+CREATE INDEX idx_btp_assignment ON llx_btp_ticket (fk_user_assign, date_creation);
+```
+
+#### **Problèmes Mobile**
+
+```javascript
+// Debug connectivité API
+const testApiConnection = async () => {
+    try {
+        const response = await fetch(`${API_CONFIG.BASE_URL}/status`, {
+            headers: { 'DOLAPIKEY': API_CONFIG.DOLIKEY }
+        });
+        console.log('API Status:', response.status);
+    } catch (error) {
+        console.error('API Error:', error);
+        // Basculer en mode hors ligne
+        await enableOfflineMode();
+    }
+};
+
+// Gestion cache hors ligne
+const enableOfflineMode = async () => {
+    const cachedTickets = await AsyncStorage.getItem('cached_tickets');
+    if (cachedTickets) {
+        setTickets(JSON.parse(cachedTickets));
+        showOfflineNotification();
+    }
+};
+```
+
+---
+
 **📧 Contact Projet :** ticketing-btp@entreprise.com
 **📅 Date :** 29 septembre 2024
 **📋 Version :** 1.0
