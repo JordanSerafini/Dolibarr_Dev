@@ -37,7 +37,79 @@ class SmartAnalytics:
     def predict_intervention_duration(self, ticket_data: Dict[str, Any]) -> Dict[str, Any]:
         """Prédit la durée d'intervention basée sur l'historique"""
         try:
-            # Récupérer données d'entraînement
+            # Vérifier si modèle existe et est récent
+            model_path = f"{self.models_path}duration_prediction_model.pkl"
+            model_info = self._load_or_train_duration_model(model_path)
+            
+            if not model_info:
+                logger.warning("Impossible de charger/entraîner le modèle de durée")
+                return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
+            
+            # Prédiction pour nouveau ticket
+            new_data = {
+                'intervention_type_encoded': 0,
+                'category_encoded': 0,
+                'priority_encoded': 0,
+                'estimated_duration': ticket_data.get('estimated_duration', 4),
+                'city_encoded': 0,
+                'budget_amount': ticket_data.get('budget_amount', 0)
+            }
+            
+            # Encoder les valeurs du nouveau ticket avec modèle sauvegardé
+            encoders = model_info['encoders']
+            if ticket_data.get('intervention_type') in encoders['intervention_type'].classes_:
+                new_data['intervention_type_encoded'] = encoders['intervention_type'].transform([ticket_data['intervention_type']])[0]
+            if ticket_data.get('category') in encoders['category'].classes_:
+                new_data['category_encoded'] = encoders['category'].transform([ticket_data['category']])[0]
+            if ticket_data.get('priority') in encoders['priority'].classes_:
+                new_data['priority_encoded'] = encoders['priority'].transform([ticket_data['priority']])[0]
+            if ticket_data.get('city') in encoders['city'].classes_:
+                new_data['city_encoded'] = encoders['city'].transform([ticket_data['city']])[0]
+            
+            X_new = pd.DataFrame([new_data])
+            predicted_duration = model_info['model'].predict(X_new)[0]
+            
+            logger.success(f"✅ Prédiction durée: {predicted_duration:.1f}h (modèle du {model_info['trained_at'][:10]})")
+            
+            return {
+                "predicted_duration": round(predicted_duration, 1),
+                "confidence": round(model_info['confidence'], 2),
+                "model_performance": model_info['performance'],
+                "model_age_days": (datetime.now() - datetime.fromisoformat(model_info['trained_at'].replace('Z', '+00:00').replace('+00:00', ''))).days
+            }
+            
+        except Exception as e:
+            logger.error(f"Erreur prédiction durée: {e}")
+            return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
+    
+    def _load_or_train_duration_model(self, model_path: str, max_age_days: int = 7) -> Optional[Dict[str, Any]]:
+        """Charge un modèle existant ou en entraîne un nouveau si nécessaire"""
+        from pathlib import Path
+        
+        # Vérifier si modèle existe et est récent
+        if Path(model_path).exists():
+            try:
+                with open(model_path, 'rb') as f:
+                    model_info = pickle.load(f)
+                
+                # Vérifier âge du modèle
+                trained_date = datetime.fromisoformat(model_info['trained_at'].replace('Z', '+00:00').replace('+00:00', ''))
+                age_days = (datetime.now() - trained_date).days
+                
+                if age_days <= max_age_days:
+                    logger.info(f"📊 Modèle durée chargé (âge: {age_days}j)")
+                    return model_info
+                else:
+                    logger.info(f"🔄 Modèle durée obsolète ({age_days}j), réentraînement...")
+            except Exception as e:
+                logger.warning(f"Erreur chargement modèle: {e}, réentraînement...")
+        
+        # Entraîner nouveau modèle
+        return self._train_duration_model(model_path)
+    
+    def _train_duration_model(self, model_path: str) -> Optional[Dict[str, Any]]:
+        """Entraîne un nouveau modèle de prédiction de durée"""
+        try:
             session = self.warehouse.Session()
             
             query = """
@@ -59,8 +131,8 @@ class SmartAnalytics:
             session.close()
             
             if len(df) < 10:
-                logger.warning("Pas assez de données historiques pour prédiction")
-                return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
+                logger.warning("Pas assez de données pour entraîner le modèle")
+                return None
             
             # Préparation des features
             le_type = LabelEncoder()
@@ -88,25 +160,6 @@ class SmartAnalytics:
             y_pred = model.predict(X_test)
             mae = mean_absolute_error(y_test, y_pred)
             r2 = r2_score(y_test, y_pred)
-            
-            # Prédiction pour nouveau ticket
-            new_data = {
-                'intervention_type_encoded': 0,
-                'category_encoded': 0,
-                'priority_encoded': 0,
-                'estimated_duration': ticket_data.get('estimated_duration', 4),
-                'city_encoded': 0,
-                'budget_amount': ticket_data.get('budget_amount', 0)
-            }
-            
-            # Encoder les valeurs du nouveau ticket
-            if ticket_data.get('intervention_type') in le_type.classes_:
-                new_data['intervention_type_encoded'] = le_type.transform([ticket_data['intervention_type']])[0]
-            
-            X_new = pd.DataFrame([new_data])
-            predicted_duration = model.predict(X_new)[0]
-            
-            # Calcul de la confiance basée sur la précision du modèle
             confidence = max(0.1, min(0.9, 1 - mae / np.mean(y)))
             
             # Sauvegarde du modèle
@@ -118,24 +171,21 @@ class SmartAnalytics:
                     'priority': le_priority,
                     'city': le_city
                 },
-                'performance': {'mae': mae, 'r2': r2},
+                'performance': {'mae': round(mae, 2), 'r2': round(r2, 2)},
+                'confidence': confidence,
+                'training_data_size': len(df),
                 'trained_at': datetime.now().isoformat()
             }
             
-            with open(f"{self.models_path}duration_prediction_model.pkl", 'wb') as f:
+            with open(model_path, 'wb') as f:
                 pickle.dump(model_info, f)
             
-            logger.success(f"✅ Prédiction durée: {predicted_duration:.1f}h (confiance: {confidence:.2f})")
-            
-            return {
-                "predicted_duration": round(predicted_duration, 1),
-                "confidence": round(confidence, 2),
-                "model_performance": {"mae": round(mae, 2), "r2": round(r2, 2)}
-            }
+            logger.success(f"✅ Modèle durée entraîné: MAE={mae:.2f}, R²={r2:.2f}, {len(df)} échantillons")
+            return model_info
             
         except Exception as e:
-            logger.error(f"Erreur prédiction durée: {e}")
-            return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
+            logger.error(f"Erreur entraînement modèle: {e}")
+            return None
     
     def detect_anomalies_interventions(self) -> Dict[str, Any]:
         """Détecte les anomalies dans les interventions BTP"""

@@ -6,6 +6,7 @@ import os
 from typing import Dict, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
+from .database_adapters import DatabaseAdapterFactory
 
 load_dotenv()
 
@@ -17,12 +18,28 @@ class DatabaseConfig:
     database: str
     username: str
     password: str
+    db_type: str = 'mysql'
     charset: str = 'utf8mb4'
     
     @property
     def connection_string(self) -> str:
-        """String de connexion MySQL"""
-        return f"mysql+pymysql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}?charset={self.charset}"
+        """String de connexion adaptée au SGBD"""
+        adapter = DatabaseAdapterFactory.create_adapter(self.db_type)
+        template = adapter.get_connection_string_template()
+        
+        return template.format(
+            username=self.username,
+            password=self.password,
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            charset=self.charset
+        )
+    
+    @property
+    def adapter(self):
+        """Retourne l'adaptateur pour ce SGBD"""
+        return DatabaseAdapterFactory.create_adapter(self.db_type)
 
 class DolibarrDatabaseConfig:
     """Configuration des bases de données Dolibarr"""
@@ -35,7 +52,9 @@ class DolibarrDatabaseConfig:
             port=int(os.getenv('DOLIBARR_DB_PORT', 3306)),
             database=os.getenv('DOLIBARR_DB_NAME', 'dolibarr'),
             username=os.getenv('DOLIBARR_DB_USER', 'dolibarr'),
-            password=os.getenv('DOLIBARR_DB_PASSWORD', '')
+            password=os.getenv('DOLIBARR_DB_PASSWORD', ''),
+            db_type=os.getenv('DOLIBARR_DB_TYPE', 'mysql'),
+            charset=os.getenv('DOLIBARR_DB_CHARSET', 'utf8mb4')
         )
     
     @staticmethod
@@ -46,7 +65,9 @@ class DolibarrDatabaseConfig:
             port=int(os.getenv('WAREHOUSE_DB_PORT', 3306)),
             database=os.getenv('WAREHOUSE_DB_NAME', 'dolibarr_warehouse'),
             username=os.getenv('WAREHOUSE_DB_USER', 'warehouse'),
-            password=os.getenv('WAREHOUSE_DB_PASSWORD', '')
+            password=os.getenv('WAREHOUSE_DB_PASSWORD', ''),
+            db_type=os.getenv('WAREHOUSE_DB_TYPE', 'mysql'),
+            charset=os.getenv('WAREHOUSE_DB_CHARSET', 'utf8mb4')
         )
 
 # Tables importantes Dolibarr BTP

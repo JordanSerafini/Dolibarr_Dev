@@ -4,7 +4,7 @@
 
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, Float, Text, Boolean
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, Float, Text, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.mysql import DECIMAL, TIMESTAMP
@@ -527,7 +527,8 @@ class DataWarehouse:
         try:
             with self.engine.connect() as conn:
                 for view_sql in views_sql:
-                    conn.execute(view_sql)
+                    conn.execute(text(view_sql))
+                conn.commit()
                     
             logger.success("✅ Vues analytiques créées")
             
