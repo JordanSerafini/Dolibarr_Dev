@@ -26,6 +26,7 @@ class SmartAnalytics:
         self.warehouse = DataWarehouse()
         self.models_path = "models/"
         self.predictions_cache = {}
+        self.cache_ttl = timedelta(hours=1)
         self.setup_models_directory()
         logger.info("🧠 Smart Analytics initialisé")
     
@@ -33,19 +34,65 @@ class SmartAnalytics:
         """Crée le répertoire des modèles"""
         from pathlib import Path
         Path(self.models_path).mkdir(exist_ok=True)
+
+    @staticmethod
+    def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+        """Parse une date ISO 8601 et retourne un datetime ou None."""
+        if not value:
+            return None
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            logger.warning(f"Date ISO invalide pour le modele: {value}")
+            return None
+
+    def _store_prediction_cache(self, cache_key: str, result: Dict[str, Any], trained_at: Optional[str]) -> None:
+        """Stocke le resultat d'une prediction en cache avec limite de taille."""
+        self.predictions_cache[cache_key] = {
+            "result": result,
+            "model_trained_at": trained_at,
+            "cached_at": datetime.now().isoformat()
+        }
+        if len(self.predictions_cache) > 500:
+            oldest_key = next(iter(self.predictions_cache))
+            if oldest_key != cache_key:
+                self.predictions_cache.pop(oldest_key, None)
+
+    @staticmethod
+    def _calculate_percentage_change(current_value: float, previous_value: float) -> Optional[float]:
+        """Calcule une variation percentuelle en controlant les divisions par zero."""
+        if pd.isna(current_value) or pd.isna(previous_value):
+            return None
+        if abs(previous_value) < 1e-6:
+            return None
+        change = (current_value - previous_value) / previous_value * 100
+        return round(change, 1)
     
     def predict_intervention_duration(self, ticket_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Prédit la durée d'intervention basée sur l'historique"""
+        """Predite la duree d'intervention basee sur l'historique"""
         try:
-            # Vérifier si modèle existe et est récent
             model_path = f"{self.models_path}duration_prediction_model.pkl"
             model_info = self._load_or_train_duration_model(model_path)
-            
+
             if not model_info:
-                logger.warning("Impossible de charger/entraîner le modèle de durée")
+                logger.warning("Impossible de charger/entrainer le modele de duree")
                 return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
-            
-            # Prédiction pour nouveau ticket
+
+            cache_key = json.dumps(ticket_data, sort_keys=True, default=str)
+            cached_result = self.predictions_cache.get(cache_key)
+            if cached_result:
+                cached_at = self._parse_iso_datetime(cached_result.get("cached_at"))
+                if (
+                    cached_result.get("model_trained_at") == model_info.get("trained_at")
+                    and cached_at
+                    and datetime.now() - cached_at <= self.cache_ttl
+                ):
+                    logger.info("Prediction duree renvoyee depuis le cache")
+                    return cached_result["result"]
+                if cached_at and datetime.now() - cached_at > self.cache_ttl:
+                    self.predictions_cache.pop(cache_key, None)
+
             new_data = {
                 'intervention_type_encoded': 0,
                 'category_encoded': 0,
@@ -54,8 +101,7 @@ class SmartAnalytics:
                 'city_encoded': 0,
                 'budget_amount': ticket_data.get('budget_amount', 0)
             }
-            
-            # Encoder les valeurs du nouveau ticket avec modèle sauvegardé
+
             encoders = model_info['encoders']
             if ticket_data.get('intervention_type') in encoders['intervention_type'].classes_:
                 new_data['intervention_type_encoded'] = encoders['intervention_type'].transform([ticket_data['intervention_type']])[0]
@@ -65,23 +111,32 @@ class SmartAnalytics:
                 new_data['priority_encoded'] = encoders['priority'].transform([ticket_data['priority']])[0]
             if ticket_data.get('city') in encoders['city'].classes_:
                 new_data['city_encoded'] = encoders['city'].transform([ticket_data['city']])[0]
-            
+
             X_new = pd.DataFrame([new_data])
             predicted_duration = model_info['model'].predict(X_new)[0]
-            
-            logger.success(f"✅ Prédiction durée: {predicted_duration:.1f}h (modèle du {model_info['trained_at'][:10]})")
-            
-            return {
+
+            trained_at_value = model_info.get('trained_at', '')
+            logger.success(f"Prediction duree: {predicted_duration:.1f}h (modele du {trained_at_value[:10]})")
+
+            trained_at_dt = self._parse_iso_datetime(model_info.get('trained_at'))
+            model_age_days = (datetime.now() - trained_at_dt).days if trained_at_dt else 0
+
+            result = {
                 "predicted_duration": round(predicted_duration, 1),
-                "confidence": round(model_info['confidence'], 2),
-                "model_performance": model_info['performance'],
-                "model_age_days": (datetime.now() - datetime.fromisoformat(model_info['trained_at'].replace('Z', '+00:00').replace('+00:00', ''))).days
+                "confidence": round(model_info.get('confidence', 0.1), 2),
+                "model_performance": model_info.get('performance', {}),
+                "model_age_days": model_age_days,
+                "training_data_size": model_info.get('training_data_size')
             }
-            
+
+            self._store_prediction_cache(cache_key, result, model_info.get('trained_at'))
+
+            return result
+
         except Exception as e:
-            logger.error(f"Erreur prédiction durée: {e}")
+            logger.error(f"Erreur prediction duree: {e}")
             return {"predicted_duration": ticket_data.get("estimated_duration", 4), "confidence": 0.1}
-    
+
     def _load_or_train_duration_model(self, model_path: str, max_age_days: int = 7) -> Optional[Dict[str, Any]]:
         """Charge un modèle existant ou en entraîne un nouveau si nécessaire"""
         from pathlib import Path
@@ -91,16 +146,17 @@ class SmartAnalytics:
             try:
                 with open(model_path, 'rb') as f:
                     model_info = pickle.load(f)
-                
-                # Vérifier âge du modèle
-                trained_date = datetime.fromisoformat(model_info['trained_at'].replace('Z', '+00:00').replace('+00:00', ''))
-                age_days = (datetime.now() - trained_date).days
-                
-                if age_days <= max_age_days:
-                    logger.info(f"📊 Modèle durée chargé (âge: {age_days}j)")
-                    return model_info
+
+                trained_date = self._parse_iso_datetime(model_info.get('trained_at'))
+                if trained_date:
+                    age_days = (datetime.now() - trained_date).days
+                    if age_days <= max_age_days:
+                        logger.info(f"Modele duree charge (age: {age_days}j)")
+                        return model_info
+                    logger.info(f"Modele duree obsolete ({age_days}j), reentrainement...")
                 else:
-                    logger.info(f"🔄 Modèle durée obsolète ({age_days}j), réentraînement...")
+                    logger.info("Date d'entrainement du modele indisponible, reentrainement...")
+
             except Exception as e:
                 logger.warning(f"Erreur chargement modèle: {e}, réentraînement...")
         
@@ -532,27 +588,36 @@ class SmartAnalytics:
             current_week = df.tail(7)
             previous_week = df.iloc[-14:-7] if len(df) >= 14 else df.head(7)
             
-            kpi_comparison = {
-                "tickets_change": ((current_week['daily_tickets'].mean() - previous_week['daily_tickets'].mean()) / previous_week['daily_tickets'].mean() * 100),
-                "resolution_change": ((current_week['avg_resolution'].mean() - previous_week['avg_resolution'].mean()) / previous_week['avg_resolution'].mean() * 100),
-                "satisfaction_change": ((current_week['avg_satisfaction'].mean() - previous_week['avg_satisfaction'].mean()) / previous_week['avg_satisfaction'].mean() * 100),
-                "revenue_change": ((current_week['daily_revenue'].mean() - previous_week['daily_revenue'].mean()) / previous_week['daily_revenue'].mean() * 100)
+            kpi_comparison: Dict[str, Optional[float]] = {}
+            kpi_columns = {
+                "tickets_change": "daily_tickets",
+                "resolution_change": "avg_resolution",
+                "satisfaction_change": "avg_satisfaction",
+                "revenue_change": "daily_revenue"
             }
-            
-            # Insights KPI
+
+            for kpi_name, column in kpi_columns.items():
+                change = self._calculate_percentage_change(
+                    current_week[column].mean(),
+                    previous_week[column].mean()
+                )
+                kpi_comparison[kpi_name] = change
+
             for kpi, change in kpi_comparison.items():
-                if abs(change) > 10:  # Changement significatif
+                if change is None:
+                    continue
+                if abs(change) > 10:
                     direction = "hausse" if change > 0 else "baisse"
                     severity = "positive" if (change > 0 and kpi in ['satisfaction_change', 'revenue_change']) or \
-                                          (change < 0 and kpi in ['tickets_change', 'resolution_change']) else "warning"
-                    
+                                      (change < 0 and kpi in ['tickets_change', 'resolution_change']) else "warning"
+
                     insights.append({
                         "type": "kpi_change",
                         "category": kpi.replace('_change', ''),
                         "message": f"{kpi.replace('_change', '').title()} en {direction} de {abs(change):.1f}%",
                         "severity": severity
                     })
-            
+
             logger.success(f"✅ Insights performance générés: {len(insights)} insights")
             
             return {
