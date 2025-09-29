@@ -690,6 +690,249 @@ class BtpTicket extends CommonObject
 }
 ```
 
+#### **Règles d'Automatisation Avancées**
+
+```php
+// /htdocs/btp/class/btpworkflow.class.php
+
+class BtpWorkflow extends CommonObject
+{
+    /**
+     * Règles d'automatisation par événement
+     */
+    public static $workflow_rules = [
+        'ticket_created' => [
+            'auto_assign_based_on_location',
+            'send_sms_to_client',
+            'create_calendar_event',
+            'check_stock_availability'
+        ],
+        'ticket_assigned' => [
+            'notify_technician_push',
+            'send_client_confirmation',
+            'block_calendar_slot'
+        ],
+        'intervention_started' => [
+            'start_timer_tracking',
+            'notify_manager_if_critical',
+            'check_safety_requirements'
+        ],
+        'intervention_completed' => [
+            'generate_invoice_if_configured',
+            'update_stock_levels',
+            'schedule_followup',
+            'request_client_satisfaction'
+        ],
+        'ticket_overdue' => [
+            'escalate_to_manager',
+            'send_urgent_notifications',
+            'create_backup_assignment'
+        ]
+    ];
+
+    /**
+     * Assignation automatique basée sur géolocalisation et disponibilité
+     */
+    public function autoAssignByLocation($ticketId)
+    {
+        global $db;
+
+        $ticket = new BtpTicket($db);
+        $ticket->fetch($ticketId);
+
+        // Requête pour trouver le technicien le plus proche et disponible
+        $sql = "SELECT u.rowid, u.firstname, u.lastname,
+                       (6371 * acos(cos(radians(".$ticket->gps_latitude."))
+                        * cos(radians(gps_lat))
+                        * cos(radians(gps_lng) - radians(".$ticket->gps_longitude."))
+                        + sin(radians(".$ticket->gps_latitude."))
+                        * sin(radians(gps_lat)))) AS distance,
+                       COUNT(t2.rowid) as current_tickets
+                FROM ".MAIN_DB_PREFIX."user u
+                LEFT JOIN ".MAIN_DB_PREFIX."user_extrafields ue ON ue.fk_object = u.rowid
+                LEFT JOIN ".MAIN_DB_PREFIX."btp_ticket t2 ON t2.fk_user_assign = u.rowid
+                    AND t2.status IN ('assigne', 'en_cours')
+                WHERE u.employee = 1 AND u.statut = 1
+                    AND ue.gps_lat IS NOT NULL AND ue.gps_lng IS NOT NULL
+                    AND u.rowid IN (SELECT fk_user FROM user_competences WHERE competence LIKE '%".$ticket->category."%')
+                GROUP BY u.rowid
+                HAVING current_tickets < 5
+                ORDER BY distance ASC, current_tickets ASC
+                LIMIT 1";
+
+        $resql = $db->query($sql);
+        if ($resql && $db->num_rows($resql) > 0) {
+            $obj = $db->fetch_object($resql);
+            $ticket->fk_user_assign = $obj->rowid;
+            $ticket->status = 'assigne';
+            $ticket->update();
+
+            // Log automatisation
+            $this->logWorkflowAction($ticketId, 'auto_assign',
+                "Assigné automatiquement à {$obj->firstname} {$obj->lastname} (distance: ".round($obj->distance, 2)." km)");
+
+            return $obj->rowid;
+        }
+
+        return false;
+    }
+
+    /**
+     * Vérification automatique des stocks requis
+     */
+    public function checkStockAvailability($ticketId)
+    {
+        global $db;
+
+        $ticket = new BtpTicket($db);
+        $ticket->fetch($ticketId);
+
+        // Analyser la description pour identifier les pièces potentiellement nécessaires
+        $keywords_pieces = [
+            'disjoncteur' => 2,      // Produit ID 2
+            'câble' => 1,            // Produit ID 1
+            'prise' => 3,            // Produit ID 3
+            'tableau' => 4,          // Produit ID 4
+            'spot' => 5              // Produit ID 5
+        ];
+
+        $pieces_probables = [];
+        foreach ($keywords_pieces as $keyword => $productId) {
+            if (stripos($ticket->description, $keyword) !== false) {
+                $pieces_probables[] = $productId;
+            }
+        }
+
+        if (!empty($pieces_probables)) {
+            // Vérifier stocks disponibles
+            $sql = "SELECT p.ref, p.label, SUM(s.reel) as stock_total
+                    FROM ".MAIN_DB_PREFIX."product p
+                    LEFT JOIN ".MAIN_DB_PREFIX."product_stock s ON s.fk_product = p.rowid
+                    WHERE p.rowid IN (".implode(',', $pieces_probables).")
+                    GROUP BY p.rowid
+                    HAVING stock_total < 5"; // Seuil d'alerte
+
+            $resql = $db->query($sql);
+            if ($resql && $db->num_rows($resql) > 0) {
+                while ($obj = $db->fetch_object($resql)) {
+                    // Créer alerte stock faible
+                    $alerte = new BtpAlerte($db);
+                    $alerte->type_alerte = 'materiel';
+                    $alerte->niveau = 'warning';
+                    $alerte->fk_ticket = $ticketId;
+                    $alerte->titre = "Stock faible: ".$obj->label;
+                    $alerte->message = "Stock restant: ".$obj->stock_total." unités";
+                    $alerte->create();
+                }
+            }
+        }
+    }
+
+    /**
+     * Génération automatique de facture après intervention
+     */
+    public function autoGenerateInvoice($ticketId)
+    {
+        global $db, $user, $conf;
+
+        if (!$conf->facture->enabled) return false;
+
+        $ticket = new BtpTicket($db);
+        $ticket->fetch($ticketId);
+
+        // Créer facture
+        require_once DOL_DOCUMENT_ROOT.'/compta/facture/class/facture.class.php';
+        $facture = new Facture($db);
+
+        $facture->socid = $ticket->fk_soc;
+        $facture->date = time();
+        $facture->note_private = "Facture générée automatiquement - Ticket: ".$ticket->ref;
+        $facture->fk_project = $ticket->fk_projet;
+
+        $facture_id = $facture->create($user);
+
+        if ($facture_id > 0) {
+            // Ajouter lignes basées sur temps passé et matériel
+            $sql = "SELECT SUM(cout_total) as cout_main_oeuvre
+                    FROM ".MAIN_DB_PREFIX."btp_ticket_temps
+                    WHERE fk_ticket = ".$ticketId;
+            $resql = $db->query($sql);
+            $temps = $db->fetch_object($resql);
+
+            if ($temps->cout_main_oeuvre > 0) {
+                $facture->addline("Main d'œuvre - ".$ticket->ref,
+                                 $temps->cout_main_oeuvre, 1, 20, 0, 0, 0, 'MO');
+            }
+
+            // Ajouter matériel utilisé
+            $sql = "SELECT p.ref, p.label, tm.qty_reelle, tm.prix_unitaire, tm.total_ht
+                    FROM ".MAIN_DB_PREFIX."btp_ticket_materiel tm
+                    LEFT JOIN ".MAIN_DB_PREFIX."product p ON p.rowid = tm.fk_product
+                    WHERE tm.fk_ticket = ".$ticketId." AND tm.qty_reelle > 0";
+            $resql = $db->query($sql);
+
+            while ($obj = $db->fetch_object($resql)) {
+                $facture->addline($obj->label, $obj->prix_unitaire, $obj->qty_reelle, 20);
+            }
+
+            // Lier facture au ticket
+            $ticket->fk_facture = $facture_id;
+            $ticket->update();
+
+            $this->logWorkflowAction($ticketId, 'invoice_created',
+                "Facture ".$facture->ref." créée automatiquement");
+
+            return $facture_id;
+        }
+
+        return false;
+    }
+
+    /**
+     * Intégration Cron pour automatisations périodiques
+     */
+    public static function cronEscalateOverdueTickets()
+    {
+        global $db;
+
+        $now = new DateTime();
+
+        // Tickets dépassant SLA de réponse
+        $sql = "SELECT rowid FROM ".MAIN_DB_PREFIX."btp_ticket
+                WHERE status = 'nouveau'
+                AND TIMESTAMPDIFF(HOUR, date_creation, NOW()) > sla_response_hours";
+
+        $resql = $db->query($sql);
+        $escalated = 0;
+
+        while ($obj = $db->fetch_object($resql)) {
+            $ticket = new BtpTicket($db);
+            $ticket->fetch($obj->rowid);
+            if ($ticket->checkEscalation()) {
+                $escalated++;
+            }
+        }
+
+        return "SLA vérifiés: ".$escalated." tickets escaladés";
+    }
+
+    /**
+     * Log des actions automatisées
+     */
+    private function logWorkflowAction($ticketId, $action, $details)
+    {
+        global $db;
+
+        $sql = "INSERT INTO ".MAIN_DB_PREFIX."btp_ticket_historique
+                (fk_ticket, type_action, details, declencheur, date_action)
+                VALUES (".$ticketId.", 'workflow_auto', '".$db->escape($details)."',
+                        '".$db->escape($action)."', NOW())";
+
+        $db->query($sql);
+    }
+}
+```
+
 ---
 
 ## 📱 5. Interface Utilisateur Mobile/Web
@@ -967,6 +1210,329 @@ const TicketingDashboard = () => {
                             }}
                             onClick={() => handleMarkerClick(ticket)}
                         />
+                    ))}
+                </GoogleMap>
+            </div>
+        </div>
+    );
+};
+```
+
+#### **Interface Client Web Self-Service**
+
+```html
+<!-- Portal client intégré dans Dolibarr -->
+<div class="btp-client-portal">
+    <div class="portal-header">
+        <h1>Mes Interventions BTP</h1>
+        <div class="client-info">
+            <span id="client-name">Bouygues Construction</span>
+            <span id="active-projects">4 projets actifs</span>
+        </div>
+    </div>
+
+    <!-- Création de ticket simplifié -->
+    <div class="quick-ticket-form">
+        <h3>Nouvelle Demande d'Intervention</h3>
+        <form id="client-ticket-form">
+            <div class="form-group">
+                <label>Type d'intervention</label>
+                <select name="type_ticket" required>
+                    <option value="depannage">Dépannage</option>
+                    <option value="maintenance">Maintenance</option>
+                    <option value="installation">Installation</option>
+                    <option value="urgence">Urgence</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Projet/Chantier</label>
+                <select name="fk_projet">
+                    <option value="">Sélectionner un projet</option>
+                    <option value="1">Tour Défense</option>
+                    <option value="2">Usine Vinci</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Description du problème</label>
+                <textarea name="description" rows="4" required
+                    placeholder="Décrivez le problème rencontré..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>Niveau d'urgence</label>
+                <div class="priority-buttons">
+                    <button type="button" class="priority-btn" data-priority="2">
+                        Normal
+                    </button>
+                    <button type="button" class="priority-btn" data-priority="4">
+                        Urgent
+                    </button>
+                    <button type="button" class="priority-btn critical" data-priority="5">
+                        Critique
+                    </button>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Photos (optionnel)</label>
+                <input type="file" name="photos[]" multiple accept="image/*">
+                <div class="photo-preview"></div>
+            </div>
+
+            <button type="submit" class="btn-primary">
+                <i class="fas fa-plus"></i>
+                Créer la demande
+            </button>
+        </form>
+    </div>
+
+    <!-- Suivi des tickets -->
+    <div class="tickets-tracking">
+        <h3>Mes Demandes en Cours</h3>
+        <div class="tickets-list">
+            <div class="ticket-card" data-status="assigne">
+                <div class="ticket-header">
+                    <span class="ticket-ref">#BTP-2024-001</span>
+                    <span class="status-badge status-assigned">Assigné</span>
+                </div>
+                <div class="ticket-content">
+                    <h4>Dépannage éclairage Bureau 15e étage</h4>
+                    <p>Problème d'éclairage dans les bureaux du 15e étage...</p>
+                    <div class="ticket-meta">
+                        <span><i class="fas fa-user"></i> Michel Dubois</span>
+                        <span><i class="fas fa-clock"></i> Prévu: 29/09 14h00</span>
+                        <span><i class="fas fa-map-marker"></i> Tour Défense</span>
+                    </div>
+                </div>
+                <div class="ticket-actions">
+                    <button class="btn-outline" onclick="trackTicket(1)">
+                        <i class="fas fa-eye"></i> Suivre
+                    </button>
+                    <button class="btn-outline" onclick="contactTechnician(1)">
+                        <i class="fas fa-phone"></i> Contacter
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+```
+
+#### **Composants UI Avancés**
+
+```javascript
+// Composant React pour gestion temps réel
+const RealTimeTicketMonitor = () => {
+    const [notifications, setNotifications] = useState([]);
+    const [soundEnabled, setSoundEnabled] = useState(true);
+
+    useEffect(() => {
+        // WebSocket pour notifications temps réel
+        const ws = new WebSocket('ws://dolibarr.local:8080/btp-tickets');
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            switch (data.type) {
+                case 'ticket_created':
+                    showNotification('Nouveau ticket', data.ticket.title, 'info');
+                    if (soundEnabled) playNotificationSound('new');
+                    break;
+
+                case 'ticket_urgent':
+                    showNotification('Ticket urgent!', data.ticket.title, 'urgent');
+                    if (soundEnabled) playNotificationSound('urgent');
+                    break;
+
+                case 'sla_breach':
+                    showNotification('SLA dépassé', data.ticket.title, 'warning');
+                    if (soundEnabled) playNotificationSound('alert');
+                    break;
+
+                case 'intervention_completed':
+                    showNotification('Intervention terminée', data.ticket.title, 'success');
+                    break;
+            }
+        };
+
+        return () => ws.close();
+    }, [soundEnabled]);
+
+    const showNotification = (title, message, type) => {
+        const notification = {
+            id: Date.now(),
+            title,
+            message,
+            type,
+            timestamp: new Date()
+        };
+
+        setNotifications(prev => [notification, ...prev.slice(0, 9)]);
+
+        // Notification navigateur si permission accordée
+        if (Notification.permission === 'granted') {
+            new Notification(title, {
+                body: message,
+                icon: `/images/btp-${type}.png`,
+                tag: `btp-${notification.id}`
+            });
+        }
+
+        // Auto-supprimer après 5 secondes
+        setTimeout(() => {
+            setNotifications(prev => prev.filter(n => n.id !== notification.id));
+        }, 5000);
+    };
+
+    const playNotificationSound = (type) => {
+        const audio = new Audio(`/sounds/btp-${type}.mp3`);
+        audio.volume = 0.3;
+        audio.play().catch(() => {}); // Ignorer erreurs autoplay
+    };
+
+    return (
+        <div className="realtime-monitor">
+            <div className="monitor-header">
+                <h3>Monitoring Temps Réel</h3>
+                <div className="monitor-controls">
+                    <button
+                        onClick={() => setSoundEnabled(!soundEnabled)}
+                        className={`sound-toggle ${soundEnabled ? 'enabled' : 'disabled'}`}
+                    >
+                        <i className={`fas fa-volume-${soundEnabled ? 'up' : 'mute'}`}></i>
+                    </button>
+                </div>
+            </div>
+
+            <div className="notifications-panel">
+                {notifications.map(notification => (
+                    <div key={notification.id} className={`notification ${notification.type}`}>
+                        <div className="notification-icon">
+                            <i className={getNotificationIcon(notification.type)}></i>
+                        </div>
+                        <div className="notification-content">
+                            <h4>{notification.title}</h4>
+                            <p>{notification.message}</p>
+                            <span className="timestamp">
+                                {notification.timestamp.toLocaleTimeString()}
+                            </span>
+                        </div>
+                        <button
+                            onClick={() => dismissNotification(notification.id)}
+                            className="dismiss-btn"
+                        >
+                            <i className="fas fa-times"></i>
+                        </button>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// Widget carte interactive avec clustering
+const InteractiveTicketMap = ({ tickets }) => {
+    const [selectedTicket, setSelectedTicket] = useState(null);
+    const [mapCenter, setMapCenter] = useState({ lat: 45.7640, lng: 4.8357 }); // Lyon
+    const [zoom, setZoom] = useState(11);
+
+    const ticketClusters = useMemo(() => {
+        // Grouper tickets par proximité géographique
+        return clusterTickets(tickets, zoom);
+    }, [tickets, zoom]);
+
+    const getTicketMarkerColor = (ticket) => {
+        const colors = {
+            1: '#28a745', // Faible - Vert
+            2: '#17a2b8', // Normal - Bleu
+            3: '#ffc107', // Moyen - Orange
+            4: '#fd7e14', // Urgent - Orange foncé
+            5: '#dc3545'  // Critique - Rouge
+        };
+        return colors[ticket.priority] || '#6c757d';
+    };
+
+    const handleTicketSelect = (ticket) => {
+        setSelectedTicket(ticket);
+        setMapCenter({
+            lat: parseFloat(ticket.gps_latitude),
+            lng: parseFloat(ticket.gps_longitude)
+        });
+        setZoom(15);
+    };
+
+    return (
+        <div className="interactive-map-container">
+            <div className="map-sidebar">
+                <div className="map-controls">
+                    <h3>Tickets sur Carte</h3>
+                    <div className="legend">
+                        <h4>Légende Priorités</h4>
+                        <div className="legend-item">
+                            <span className="legend-dot" style={{ backgroundColor: '#dc3545' }}></span>
+                            Critique (2h max)
+                        </div>
+                        <div className="legend-item">
+                            <span className="legend-dot" style={{ backgroundColor: '#fd7e14' }}></span>
+                            Urgent (4h max)
+                        </div>
+                        <div className="legend-item">
+                            <span className="legend-dot" style={{ backgroundColor: '#ffc107' }}></span>
+                            Moyen (8h max)
+                        </div>
+                        <div className="legend-item">
+                            <span className="legend-dot" style={{ backgroundColor: '#17a2b8' }}></span>
+                            Normal (24h max)
+                        </div>
+                    </div>
+                </div>
+
+                <div className="tickets-list-sidebar">
+                    {tickets.map(ticket => (
+                        <div
+                            key={ticket.rowid}
+                            className={`ticket-item ${selectedTicket?.rowid === ticket.rowid ? 'selected' : ''}`}
+                            onClick={() => handleTicketSelect(ticket)}
+                        >
+                            <div className="ticket-priority-indicator"
+                                 style={{ backgroundColor: getTicketMarkerColor(ticket) }}>
+                                {ticket.priority}
+                            </div>
+                            <div className="ticket-details">
+                                <h5>{ticket.ref}</h5>
+                                <p>{ticket.title}</p>
+                                <small>{ticket.client_name}</small>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            <div className="map-container">
+                <GoogleMap
+                    zoom={zoom}
+                    center={mapCenter}
+                    options={{
+                        styles: mapStyles,
+                        gestureHandling: 'greedy'
+                    }}
+                >
+                    {ticketClusters.map(cluster => (
+                        cluster.tickets.length > 1 ? (
+                            <MarkerCluster
+                                key={`cluster-${cluster.id}`}
+                                position={cluster.center}
+                                tickets={cluster.tickets}
+                            />
+                        ) : (
+                            <TicketMarker
+                                key={cluster.tickets[0].rowid}
+                                ticket={cluster.tickets[0]}
+                                onSelect={handleTicketSelect}
+                            />
+                        )
                     ))}
                 </GoogleMap>
             </div>
