@@ -9,6 +9,7 @@ import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { MaterialIcons, FontAwesome5 } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // Screens
 import DashboardScreen from './screens/DashboardScreen';
@@ -17,6 +18,7 @@ import ProfileScreen from './screens/ProfileScreen';
 
 // Additional screens
 import TicketListScreen from './screens/TicketListScreen';
+import TicketDetailsScreen from './screens/TicketDetailsScreen';
 import MapScreen from './screens/MapScreen';
 import CameraScreen from './screens/CameraScreen';
 
@@ -25,6 +27,8 @@ const Tab = createBottomTabNavigator();
 
 // Tab Navigator avec gamification
 function MainTabs() {
+  const insets = useSafeAreaInsets();
+  
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -59,8 +63,9 @@ function MainTabs() {
           backgroundColor: '#1a1a1a',
           borderTopColor: '#333',
           borderTopWidth: 1,
-          paddingBottom: 5,
-          height: 60,
+          paddingBottom: insets.bottom + 5,
+          paddingTop: 10,
+          height: 60 + insets.bottom,
         },
         tabBarLabelStyle: {
           fontSize: 12,
@@ -129,6 +134,14 @@ export default function App() {
         <Stack.Screen name="Main" component={MainTabs} />
 
         {/* Écrans modaux/overlay */}
+        <Stack.Screen
+          name="TicketDetails"
+          component={TicketDetailsScreen}
+          options={{
+            presentation: 'card',
+            gestureEnabled: true,
+          }}
+        />
         <Stack.Screen
           name="Intervention"
           component={InterventionScreen}
