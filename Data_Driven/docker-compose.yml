@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # Base de données DataWarehouse
+  warehouse-db:
+    image: mysql:8.0
+    container_name: dolibarr-warehouse-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: dolibarr_warehouse
+      MYSQL_USER: warehouse_user
+      MYSQL_PASSWORD: warehouse_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - warehouse_data:/var/lib/mysql
+      - ./sql/warehouse_init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - dolibarr-data-network
+    restart: unless-stopped
+
+  # Application Data-Driven
+  data-driven-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dolibarr-data-driven
+    environment:
+      - DOLIBARR_DB_HOST=host.docker.internal
+      - DOLIBARR_DB_PORT=3306
+      - DOLIBARR_DB_NAME=dolibarr
+      - DOLIBARR_DB_USER=dolibarr_user
+      - DOLIBARR_DB_PASSWORD=dolibarr_password
+      - WAREHOUSE_DB_HOST=warehouse-db
+      - WAREHOUSE_DB_PORT=3306
+      - WAREHOUSE_DB_NAME=dolibarr_warehouse
+      - WAREHOUSE_DB_USER=warehouse_user
+      - WAREHOUSE_DB_PASSWORD=warehouse_password
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+    depends_on:
+      - warehouse-db
+    networks:
+      - dolibarr-data-network
+    restart: unless-stopped
+    command: python src/main.py pipeline
+
+  # Scheduler pour automatisation
+  data-driven-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dolibarr-data-scheduler
+    environment:
+      - DOLIBARR_DB_HOST=host.docker.internal
+      - DOLIBARR_DB_PORT=3306
+      - DOLIBARR_DB_NAME=dolibarr
+      - DOLIBARR_DB_USER=dolibarr_user
+      - DOLIBARR_DB_PASSWORD=dolibarr_password
+      - WAREHOUSE_DB_HOST=warehouse-db
+      - WAREHOUSE_DB_PORT=3306
+      - WAREHOUSE_DB_NAME=dolibarr_warehouse
+      - WAREHOUSE_DB_USER=warehouse_user
+      - WAREHOUSE_DB_PASSWORD=warehouse_password
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+    depends_on:
+      - warehouse-db
+    networks:
+      - dolibarr-data-network
+    restart: unless-stopped
+    command: python scripts/scheduler.py daemon
+
+  # Dashboard Streamlit (optionnel)
+  data-driven-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dolibarr-data-dashboard
+    environment:
+      - WAREHOUSE_DB_HOST=warehouse-db
+      - WAREHOUSE_DB_PORT=3306
+      - WAREHOUSE_DB_NAME=dolibarr_warehouse
+      - WAREHOUSE_DB_USER=warehouse_user
+      - WAREHOUSE_DB_PASSWORD=warehouse_password
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    depends_on:
+      - warehouse-db
+    networks:
+      - dolibarr-data-network
+    restart: unless-stopped
+    command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+
+volumes:
+  warehouse_data:
+
+networks:
+  dolibarr-data-network:
+    driver: bridge
