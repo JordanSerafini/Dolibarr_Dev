@@ -1,0 +1,23 @@
+{
+  "name": "ebp-interfaces-generator",
+  "version": "1.0.0",
+  "description": "Générateur d'interfaces TypeScript pour EBP",
+  "main": "generate-all-interfaces.ts",
+  "scripts": {
+    "generate": "ts-node generate-all-interfaces.ts",
+    "build": "tsc",
+    "dev": "ts-node --watch generate-all-interfaces.ts"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.9",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  },
+  "keywords": ["ebp", "interfaces", "typescript", "postgresql"],
+  "author": "EBP Team",
+  "license": "MIT"
+}
