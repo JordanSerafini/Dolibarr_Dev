@@ -19,6 +19,7 @@ import ProfileScreen from './screens/ProfileScreen';
 // Additional screens
 import TicketListScreen from './screens/TicketListScreen';
 import TicketDetailsScreen from './screens/TicketDetailsScreen';
+import DiagnosticFormScreen from './screens/DiagnosticFormScreen';
 import MapScreen from './screens/MapScreen';
 import CameraScreen from './screens/CameraScreen';
 
@@ -137,6 +138,14 @@ export default function App() {
         <Stack.Screen
           name="TicketDetails"
           component={TicketDetailsScreen}
+          options={{
+            presentation: 'card',
+            gestureEnabled: true,
+          }}
+        />
+        <Stack.Screen
+          name="DiagnosticForm"
+          component={DiagnosticFormScreen}
           options={{
             presentation: 'card',
             gestureEnabled: true,
