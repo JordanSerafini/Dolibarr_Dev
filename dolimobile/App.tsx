@@ -15,7 +15,7 @@ import DashboardScreen from './screens/DashboardScreen';
 import InterventionScreen from './screens/InterventionScreen';
 import ProfileScreen from './screens/ProfileScreen';
 
-// Additional screens (placeholders)
+// Additional screens
 import TicketListScreen from './screens/TicketListScreen';
 import MapScreen from './screens/MapScreen';
 import CameraScreen from './screens/CameraScreen';
